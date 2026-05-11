@@ -5,61 +5,134 @@ local M       = {}
 local token_file   = wezterm.config_dir .. '/.sync_token'
 local gist_id_file = wezterm.config_dir .. '/.sync_gist_id'
 
--- ─── Platform ────────────────────────────────────────────────────────────────
+-- ─── Pure-Lua JSON helpers ────────────────────────────────────────────────────
+-- No external dependencies — encode/decode only what the Gist API needs.
 
-local function is_windows()
-  return wezterm.target_triple:find('windows') ~= nil
+local function json_encode_string(s)
+  return '"' .. s
+    :gsub('\\', '\\\\')
+    :gsub('"',  '\\"')
+    :gsub('\n', '\\n')
+    :gsub('\r', '\\r')
+    :gsub('\t', '\\t')
+    :gsub('%c', function(c) return ('\\u%04x'):format(c:byte()) end)
+    .. '"'
 end
 
-local function is_mac()
-  return wezterm.target_triple:find('apple') ~= nil
-end
-
--- Convert a Windows path (C:\foo\bar) to a WSL path (/mnt/c/foo/bar).
--- No-op on Linux/macOS.
-local function wsl_path(path)
-  if not is_windows() then return path end
-  return path:gsub('\\', '/'):gsub('^(%a):', function(d) return '/mnt/' .. d:lower() end)
-end
-
--- Run a Python script with env vars and optional extra args accessible via sys.argv.
--- On Windows uses `wsl.exe env ...`; elsewhere uses `env ...` directly.
-local function run_python(script, env_vars, extra_args)
-  local cmd = is_windows() and { 'wsl.exe', 'env' } or { 'env' }
-  for k, v in pairs(env_vars) do
-    table.insert(cmd, k .. '=' .. v)
+local function build_push_payload(content, is_new)
+  local files = '{"wezterm.lua":{"content":' .. json_encode_string(content) .. '}}'
+  if is_new then
+    return '{"description":"WezTerm config","public":false,"files":' .. files .. '}'
   end
-  table.insert(cmd, 'python3')
-  table.insert(cmd, '-c')
-  table.insert(cmd, script)
-  for _, a in ipairs(extra_args or {}) do
-    table.insert(cmd, a)
-  end
-  return wezterm.run_child_process(cmd)
+  return '{"files":' .. files .. '}'
 end
 
--- Check that python3 is reachable and surface a helpful message if not.
-local function check_deps(window)
-  local cmd = is_windows()
-    and { 'wsl.exe', 'python3', '--version' }
-    or  { 'python3', '--version' }
-  local ok = wezterm.run_child_process(cmd)
-  if not ok then
-    if is_windows() then
-      notify(window, 'python3 not found in WSL — run: wsl --install, then: sudo apt install python3')
-    elseif is_mac() then
-      notify(window, 'python3 not found — install it: brew install python3')
+-- Read a JSON string value from s starting at the opening '"' (position pos).
+-- Returns the decoded string and the position after the closing '"'.
+local function read_json_string(s, pos)
+  local i, t = pos + 1, {}
+  while i <= #s do
+    local c = s:sub(i, i)
+    if c == '"' then
+      return table.concat(t), i + 1
+    elseif c ~= '\\' then
+      table.insert(t, c); i = i + 1
     else
-      notify(window, 'python3 not found — install it: sudo apt install python3')
+      local e = s:sub(i + 1, i + 1)
+      if     e == 'n'  then table.insert(t, '\n');  i = i + 2
+      elseif e == 'r'  then table.insert(t, '\r');  i = i + 2
+      elseif e == 't'  then table.insert(t, '\t');  i = i + 2
+      elseif e == '"'  then table.insert(t, '"');   i = i + 2
+      elseif e == '\\' then table.insert(t, '\\');  i = i + 2
+      elseif e == '/'  then table.insert(t, '/');   i = i + 2
+      elseif e == 'u'  then
+        local cp = tonumber(s:sub(i + 2, i + 5), 16) or 0
+        if     cp < 0x80  then
+          table.insert(t, string.char(cp))
+        elseif cp < 0x800 then
+          table.insert(t, string.char(0xC0 + math.floor(cp / 64), 0x80 + (cp % 64)))
+        else
+          table.insert(t, string.char(
+            0xE0 + math.floor(cp / 4096),
+            0x80 + math.floor((cp % 4096) / 64),
+            0x80 + (cp % 64)
+          ))
+        end
+        i = i + 6
+      else
+        table.insert(t, e); i = i + 2
+      end
     end
+  end
+  return nil
+end
+
+-- Extract the first "id" string value from a Gist API response.
+local function parse_gist_id(json)
+  local key_pos = json:find('"id"')
+  if not key_pos then return nil end
+  local q = json:find('"', key_pos + 5)
+  if not q then return nil end
+  return read_json_string(json, q)
+end
+
+-- Extract the file content from a Gist API response.
+local function parse_gist_content(json)
+  local file_pos = json:find('"wezterm%.lua"')
+  if not file_pos then return nil, 'wezterm.lua not found in Gist' end
+  local key_pos = json:find('"content"', file_pos)
+  if not key_pos then return nil, '"content" key not found' end
+  local q = json:find('"', key_pos + 10)
+  if not q then return nil, '"content" value not found' end
+  local content = read_json_string(json, q)
+  if not content then return nil, 'could not parse content string' end
+  return content
+end
+
+-- ─── HTTP via curl ────────────────────────────────────────────────────────────
+-- curl ships built-in on Windows 10+, macOS, and virtually all Linux distros.
+-- run_child_process passes args as a direct array (no shell), so the JSON body
+-- is passed as-is with no quoting or escaping concerns.
+
+local curl_ok = nil  -- cached after first check
+
+local function check_curl(window)
+  if curl_ok == nil then
+    curl_ok = wezterm.run_child_process({ 'curl', '--version' })
+  end
+  if not curl_ok then
+    notify(window,
+      'curl not found — it ships with Windows 10+, macOS, and most Linux distros')
     return false
   end
   return true
 end
 
--- ─── Helpers ─────────────────────────────────────────────────────────────────
+local function curl_request(method, url, token, body)
+  local cmd = {
+    'curl', '-s', '-X', method,
+    '-H', 'Authorization: token ' .. token,
+    '-H', 'Content-Type: application/json',
+  }
+  if body then
+    table.insert(cmd, '--data')
+    table.insert(cmd, body)
+  end
+  table.insert(cmd, url)
+  return wezterm.run_child_process(cmd)
+end
+
+-- ─── Helpers ──────────────────────────────────────────────────────────────────
 
 local function read_file(path)
+  local f = io.open(path, 'r')
+  if not f then return nil end
+  local s = f:read('*a')
+  f:close()
+  return (s ~= '') and s or nil
+end
+
+local function read_file_line(path)
   local f = io.open(path, 'r')
   if not f then return nil end
   local s = f:read('*l')
@@ -76,97 +149,50 @@ local function write_file(path, content)
 end
 
 local function get_token()
-  return os.getenv('WEZTERM_SYNC_TOKEN') or read_file(token_file)
+  return os.getenv('WEZTERM_SYNC_TOKEN') or read_file_line(token_file)
 end
 
 local function get_gist_id(opts)
-  return (opts and opts.gist_id) or read_file(gist_id_file)
+  return (opts and opts.gist_id) or read_file_line(gist_id_file)
 end
 
 function notify(window, msg)
   window:toast_notification('WezTerm Sync', msg, nil, 4000)
 end
 
--- ─── Push / Pull ─────────────────────────────────────────────────────────────
-
-local PUSH_SCRIPT = [[
-import json, os, sys, subprocess
-
-token       = os.environ['WEZTERM_SYNC_TOKEN']
-config_file = os.environ['WEZTERM_CONFIG_FILE']
-method, url, mode = sys.argv[1], sys.argv[2], sys.argv[3]
-
-with open(config_file) as f:
-    content = f.read()
-
-payload = {'files': {'wezterm.lua': {'content': content}}}
-if mode == 'new':
-    payload['description'] = 'WezTerm config'
-    payload['public']      = False
-
-r = subprocess.run(
-    ['curl', '-s', '-X', method,
-     '-H', 'Authorization: token ' + token,
-     '-H', 'Content-Type: application/json',
-     '-d', json.dumps(payload),
-     url],
-    capture_output=True, text=True
-)
-print(r.stdout)
-if r.stderr:
-    print(r.stderr, file=sys.stderr)
-]]
-
-local PULL_SCRIPT = [[
-import json, os, sys, subprocess
-
-token       = os.environ['WEZTERM_SYNC_TOKEN']
-config_file = os.environ['WEZTERM_CONFIG_FILE']
-gist_id     = sys.argv[1]
-
-r = subprocess.run(
-    ['curl', '-s',
-     '-H', 'Authorization: token ' + token,
-     'https://api.github.com/gists/' + gist_id],
-    capture_output=True, text=True
-)
-data    = json.loads(r.stdout)
-content = data['files']['wezterm.lua']['content']
-
-with open(config_file, 'w') as f:
-    f.write(content)
-
-print('ok')
-]]
+-- ─── Push / Pull ──────────────────────────────────────────────────────────────
 
 local function do_push(window, pane, token, gist_id)
-  if not check_deps(window) then return end
+  if not check_curl(window) then return end
 
-  local method = gist_id and 'PATCH' or 'POST'
-  local url    = gist_id
-    and ('https://api.github.com/gists/' .. gist_id)
-    or  'https://api.github.com/gists'
-  local mode   = gist_id and 'update' or 'new'
-
-  local ok, stdout, stderr = run_python(PUSH_SCRIPT, {
-    WEZTERM_SYNC_TOKEN  = token,
-    WEZTERM_CONFIG_FILE = wsl_path(wezterm.config_file),
-  }, { method, url, mode })
-
-  if not ok then
-    wezterm.log_error('wezterm-sync push failed\nstderr: ' .. (stderr or '') .. '\nstdout: ' .. (stdout or ''))
-    local hint = (stderr and stderr ~= '') and stderr:match('([^\n]+)') or 'see Help › Show Debug Log Overlay'
-    notify(window, 'Push failed: ' .. hint)
+  local content = read_file(wezterm.config_file)
+  if not content then
+    notify(window, 'Could not read config file: ' .. wezterm.config_file)
     return
   end
 
-  if not gist_id then
-    local id = stdout:match('"id"%s*:%s*"([a-f0-9]+)"')
+  local is_new  = not gist_id
+  local method  = is_new and 'POST' or 'PATCH'
+  local url     = is_new
+    and 'https://api.github.com/gists'
+    or  ('https://api.github.com/gists/' .. gist_id)
+  local payload = build_push_payload(content, is_new)
+
+  local ok, stdout, stderr = curl_request(method, url, token, payload)
+
+  if not ok then
+    wezterm.log_error('wezterm-sync push failed\n' .. (stderr or ''))
+    notify(window, 'Push failed — curl error (see Help › Show Debug Log Overlay)')
+    return
+  end
+
+  if is_new then
+    local id = parse_gist_id(stdout)
     if id then
       write_file(gist_id_file, id)
       notify(window, 'Gist created (' .. id .. ') — config pushed!')
     else
-      wezterm.log_error('wezterm-sync: unexpected API response: ' .. stdout)
+      wezterm.log_error('wezterm-sync: unexpected API response:\n' .. stdout)
       notify(window, 'Push failed — unexpected API response (see debug log)')
     end
   else
@@ -175,34 +201,44 @@ local function do_push(window, pane, token, gist_id)
 end
 
 local function do_pull(window, pane, token, gist_id)
-  if not check_deps(window) then return end
+  if not check_curl(window) then return end
 
   if not gist_id then
     notify(window, 'No Gist ID found — push first to create one')
     return
   end
 
-  local ok, stdout, stderr = run_python(PULL_SCRIPT, {
-    WEZTERM_SYNC_TOKEN  = token,
-    WEZTERM_CONFIG_FILE = wsl_path(wezterm.config_file),
-  }, { gist_id })
+  local ok, stdout, stderr = curl_request(
+    'GET', 'https://api.github.com/gists/' .. gist_id, token, nil)
 
-  if ok and stdout:match('ok') then
-    notify(window, 'Config pulled ✓ — reloading…')
-    window:perform_action(act.ReloadConfiguration, pane)
-  else
-    wezterm.log_error('wezterm-sync pull failed\nstderr: ' .. (stderr or '') .. '\nstdout: ' .. (stdout or ''))
-    local hint = (stderr and stderr ~= '') and stderr:match('([^\n]+)') or 'see Help › Show Debug Log Overlay'
-    notify(window, 'Pull failed: ' .. hint)
+  if not ok then
+    wezterm.log_error('wezterm-sync pull failed\n' .. (stderr or ''))
+    notify(window, 'Pull failed — curl error (see Help › Show Debug Log Overlay)')
+    return
   end
+
+  local content, err = parse_gist_content(stdout)
+  if not content then
+    wezterm.log_error('wezterm-sync: could not parse response: ' .. err .. '\n' .. stdout)
+    notify(window, 'Pull failed: ' .. err)
+    return
+  end
+
+  if not write_file(wezterm.config_file, content) then
+    notify(window, 'Pull failed — could not write to ' .. wezterm.config_file)
+    return
+  end
+
+  notify(window, 'Config pulled ✓ — reloading…')
+  window:perform_action(act.ReloadConfiguration, pane)
 end
 
--- ─── Token prompt ────────────────────────────────────────────────────────────
+-- ─── Token prompt ─────────────────────────────────────────────────────────────
 
 local function prompt_for_token(window, pane, on_token)
   window:perform_action(
     act.PromptInputLine {
-      description = 'GitHub token (gist scope needed — create one at: github.com/settings/tokens/new?scopes=gist)',
+      description = 'GitHub token (gist scope — create at: github.com/settings/tokens/new?scopes=gist)',
       action = wezterm.action_callback(function(win, p, line)
         if not line or line == '' then return end
         write_file(token_file, line)
@@ -214,7 +250,7 @@ local function prompt_for_token(window, pane, on_token)
   )
 end
 
--- ─── Public API ──────────────────────────────────────────────────────────────
+-- ─── Public API ───────────────────────────────────────────────────────────────
 
 --- Configure the sync plugin.
 --- opts (optional):
