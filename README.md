@@ -5,15 +5,17 @@ A [WezTerm](https://wezfurlong.org/wezterm/) plugin that syncs your config to a 
 ## Features
 
 - Push / Pull via the WezTerm command palette (`Ctrl+Shift+P` → type "Sync")
-- First-run token prompt with instructions — no manual env var setup needed
+- First-run token prompt with instructions — no manual setup needed
 - Gist is created automatically on first push; the ID is remembered locally
 - Token stored in `~/.config/wezterm/.sync_token` (never synced to the Gist)
 - Config reload triggered automatically after a pull
+- **Zero external dependencies** — pure Lua JSON encoding/decoding + `curl` (built-in on Windows 10+, macOS, and virtually all Linux distros)
 
 ## Requirements
 
-- `curl` and `python3` available in your shell (standard on macOS/Linux/WSL)
+- WezTerm (any platform — Windows, macOS, Linux)
 - A GitHub account and a [Personal Access Token](https://github.com/settings/tokens/new?scopes=gist) with the **gist** scope
+- `curl` — ships built-in on Windows 10+, macOS, and most Linux distros
 
 ## Installation
 
@@ -43,8 +45,24 @@ sync.apply_to_config(config, {
 ### On a new machine
 
 1. Install WezTerm
-2. Add the plugin require + `apply_to_config` call to a minimal `wezterm.lua`
-3. Run **Sync › Pull** — your full config is restored and reloaded automatically
+2. Create a minimal `wezterm.lua` with just the plugin require:
+   ```lua
+   local wezterm = require 'wezterm'
+   local config  = wezterm.config_builder()
+   local sync    = wezterm.plugin.require("https://github.com/dfsramos/wezterm-sync")
+   sync.apply_to_config(config)
+   return config
+   ```
+3. Open the command palette → **Sync › Pull** — your full config is restored and reloaded automatically
+
+## How it works
+
+The plugin is implemented entirely in Lua with no external dependencies beyond `curl`:
+
+- **Push**: reads your `wezterm.lua` with Lua's `io.open`, JSON-encodes the content using a pure Lua string encoder, then calls `curl` directly via `wezterm.run_child_process` to POST/PATCH the GitHub Gist API
+- **Pull**: fetches the Gist via `curl`, decodes the JSON response using a pure Lua character-by-character parser (handling all escape sequences including `\uXXXX` → UTF-8), writes the content back to your config file, then triggers a config reload
+- **No shell involved**: `curl` is invoked as a direct argument array — no bash, no PowerShell, no quoting issues across platforms
+- **Token security**: the GitHub token is passed via HTTP header at runtime and stored in a local file outside the Gist
 
 ## Local files (not synced)
 
