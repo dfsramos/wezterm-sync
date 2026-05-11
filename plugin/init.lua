@@ -36,10 +36,15 @@ local function notify(window, msg)
   window:toast_notification('WezTerm Sync', msg, nil, 4000)
 end
 
+-- Convert a Windows path (C:\foo\bar) to its WSL equivalent (/mnt/c/foo/bar)
+local function to_wsl_path(path)
+  return path:gsub('\\', '/'):gsub('^(%a):', function(d) return '/mnt/' .. d:lower() end)
+end
+
 -- ─── Push / Pull ─────────────────────────────────────────────────────────────
 
 local function do_push(window, pane, token, gist_id)
-  local config_file = wezterm.config_file
+  local config_file = to_wsl_path(wezterm.config_file)
   local method      = gist_id and 'PATCH' or 'POST'
   local url         = gist_id
     and ('https://api.github.com/gists/' .. gist_id)
@@ -102,7 +107,7 @@ local function do_pull(window, pane, token, gist_id)
     return
   end
 
-  local config_file = wezterm.config_file
+  local config_file = to_wsl_path(wezterm.config_file)
 
   local script = string.format([[
 WEZTERM_SYNC_TOKEN='%s' WEZTERM_CONFIG_FILE='%s' python3 - <<'PYEOF'
