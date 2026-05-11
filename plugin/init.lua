@@ -50,12 +50,13 @@ local function do_push(window, pane, token, gist_id)
     init_fields = "payload['description'] = 'WezTerm config'\npayload['public'] = False\n"
   end
 
-  -- Token passed via env var to avoid it appearing in ps output
+  -- Paths and token passed via env vars to avoid Windows backslash escaping issues
   local script = string.format([[
-WEZTERM_SYNC_TOKEN='%s' python3 - <<'PYEOF'
+WEZTERM_SYNC_TOKEN='%s' WEZTERM_CONFIG_FILE='%s' python3 - <<'PYEOF'
 import json, os, subprocess
 
-with open('%s') as f:
+config_path = os.environ['WEZTERM_CONFIG_FILE']
+with open(config_path) as f:
     content = f.read()
 
 token = os.environ['WEZTERM_SYNC_TOKEN']
@@ -104,10 +105,11 @@ local function do_pull(window, pane, token, gist_id)
   local config_file = wezterm.config_file
 
   local script = string.format([[
-WEZTERM_SYNC_TOKEN='%s' python3 - <<'PYEOF'
+WEZTERM_SYNC_TOKEN='%s' WEZTERM_CONFIG_FILE='%s' python3 - <<'PYEOF'
 import json, os, subprocess
 
 token = os.environ['WEZTERM_SYNC_TOKEN']
+config_path = os.environ['WEZTERM_CONFIG_FILE']
 r = subprocess.run(
     ['curl', '-s',
      '-H', 'Authorization: token ' + token,
@@ -116,11 +118,11 @@ r = subprocess.run(
 )
 data = json.loads(r.stdout)
 content = data['files']['wezterm.lua']['content']
-with open('%s', 'w') as f:
+with open(config_path, 'w') as f:
     f.write(content)
 print('ok')
 PYEOF
-]], token, gist_id, config_file)
+]], token, config_file, gist_id)
 
   local ok, stdout, stderr = wezterm.run_child_process({ 'bash', '-c', script })
 
