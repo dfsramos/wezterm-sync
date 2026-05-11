@@ -73,10 +73,12 @@ print(r.stdout)
 PYEOF
 ]], token, config_file, init_fields, method, url)
 
-  local ok, stdout, _ = wezterm.run_child_process({ 'bash', '-c', script })
+  local ok, stdout, stderr = wezterm.run_child_process({ 'bash', '-c', script })
 
   if not ok then
-    notify(window, 'Push failed — check your network or token')
+    wezterm.log_error('wezterm-sync push failed\nstderr: ' .. (stderr or '') .. '\nstdout: ' .. (stdout or ''))
+    local hint = (stderr and stderr ~= '') and stderr:match('([^\n]+)') or 'see Help › Show Debug Log Overlay'
+    notify(window, 'Push failed: ' .. hint)
     return
   end
 
@@ -120,13 +122,15 @@ print('ok')
 PYEOF
 ]], token, gist_id, config_file)
 
-  local ok, stdout, _ = wezterm.run_child_process({ 'bash', '-c', script })
+  local ok, stdout, stderr = wezterm.run_child_process({ 'bash', '-c', script })
 
   if ok and stdout:match('ok') then
     notify(window, 'Config pulled ✓ — reloading…')
     window:perform_action(act.ReloadConfiguration, pane)
   else
-    notify(window, 'Pull failed — check your token or Gist ID')
+    wezterm.log_error('wezterm-sync pull failed\nstderr: ' .. (stderr or '') .. '\nstdout: ' .. (stdout or ''))
+    local hint = (stderr and stderr ~= '') and stderr:match('([^\n]+)') or 'see Help › Show Debug Log Overlay'
+    notify(window, 'Pull failed: ' .. hint)
   end
 end
 
